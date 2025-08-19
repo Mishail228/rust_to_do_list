@@ -1,13 +1,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json;
+use crossterm::{
+    cursor::MoveTo,
+    event::{read, Event, KeyCode, KeyEventKind},
+    style::{Color, Print, SetForegroundColor, ResetColor},
+    terminal::{Clear, ClearType, enable_raw_mode, disable_raw_mode, self},
+    execute
+};
+
 use std::path::PathBuf;
 use std::fs::{File, OpenOptions};
-use std::io::{Write, Seek, SeekFrom, ErrorKind, Read};
+use std::io::{Write, Seek, SeekFrom, ErrorKind, Read, self};
 
-fn main() {
+fn main() -> io::Result<()> {
     println!("Type 'help' to view existing commands");
     let mut app = App::new();
+    enable_raw_mode()?;
     app.run();
+    disable_raw_mode()?;
+    Ok(())
 }
 
 struct App {
@@ -20,10 +31,13 @@ impl App {
     }
     fn run(&mut self) {
         'inner: loop {
+            clear_screen();
             let act = match stdin_to_action() {
                 Ok(act) => act,
                 Err(e) => {
-                    println!("If you get stuck, please type help\n Error: {e}");
+                    match output_error_and_wait(&format!("If you get stuck, please type help.\nError: {e}")) {
+                        _ => {},
+                    }
                     continue;
                 }
             };
@@ -31,7 +45,9 @@ impl App {
                 Ok(AppOk::CalledExit) => break,
                 Ok(AppOk::CalledHelp) => continue,
                 Err(e) => {
-                    println!("Please open or create a file before doing anything\n Error:{e:?}");
+                    match output_error_and_wait(&format!("Please open or create a file before doing anything.\nError:{e:?}")) {
+                        _ => {},
+                    }
                     continue;
                 }
                 _ => {}
@@ -40,14 +56,28 @@ impl App {
                 let last = match self.handle_file() {
                     Ok(l) => l,
                     Err(e) => {
-                        println!("An error occurred: {e}");
+                        match self.save_to_file() {
+                            Ok(_) => {},
+                            Err(e) => {
+                                match output_error_and_wait(&format!("Failed to save file: {e}")) {
+                                    _ => {},
+                                }
+                                break;
+                            }
+                        };
+
+                        match output_error_and_wait(&format!("An error occurred: {e}")) {
+                            _ => {},
+                        };
                         break;
                     }
                 };
                 match self.current_file.as_ref().unwrap().sync_data() {
                     Ok(_) => {}
                     Err(e) => {
-                        println!("An error occurred: {e}");
+                        match output_error_and_wait(&format!("An error occurred: {e}")) {
+                            _ => {},
+                        };
                         break;
                     }
                 };
@@ -57,11 +87,15 @@ impl App {
                     Ok(AppOk::CalledExit) => break 'inner,
                     Ok(AppOk::CalledDelete) => break,
                     Err(AppError::OpenFailed(e)) => {
-                        println!("Failed to open list: {e}");
+                        match output_error_and_wait(&format!("Failed to open list: {e}")) {
+                            _ => {},
+                        };
                         break;
                     }
                     Err(AppError::DeleteFailed(e)) => {
-                        println!("Failed to delete list: {e}");
+                        match output_error_and_wait(&format!("Failed to delete list: {e}")) {
+                            _ => {},
+                        };
                         break;
                     }
                     _ => {}
@@ -90,8 +124,10 @@ impl App {
                 Ok(AppOk::None)
             }
             Action::Help => {
-                help();
-                Ok(AppOk::CalledHelp)
+                match help() {
+                    Ok(_) => Ok(AppOk::CalledHelp),
+                    Err(e) => Err(AppError::IOError(e))
+                }
             }
             Action::Exit => Ok(AppOk::CalledExit),
             _ => Err(AppError::FileNotOpened)
@@ -109,14 +145,21 @@ impl App {
             }
         };
         loop {
-            println!("====== Your goals ======");
+            clear_screen();
+            execute!(io::stdout(), MoveTo(0, 0), Print("====== Your goals ======\n"))?;
             for (idx, t) in self.tasks.iter().enumerate() {
-                println!("{}) {}", idx + 1, t);
+                execute!(io::stdout(), Print(format!("{}) {}\n", idx + 1, t)))?;
             }
+            let (_, rows) = terminal::size()?;
+
+            execute!(io::stdout(), MoveTo(0, rows - 2))?;
+            execute!(io::stdout(), Print("===================="))?;
+            execute!(io::stdout(), MoveTo(0, rows - 1))?;
+            io::stdout().flush()?;
             let act = match stdin_to_action() {
                 Ok(act) => act,
                 Err(e) => {
-                    println!("If you get stuck, please type help.\n{e}");
+                    output_error_and_wait(&format!("If you get stuck, please type help. Err: {e}"))?;
                     continue;
                 }
             };
@@ -141,20 +184,20 @@ impl App {
                     if i != 0 && i - 1 < self.tasks.len() {
                         self.tasks.remove(i - 1);
                     } else {
-                        println!("Can't find a task with index {}", i);
+                        output_error_and_wait(&format!("Can't find a task with index {}", i))?;
                     }
                 }
                 Action::Complete(i) => {
                     let t = match self.tasks.get_mut(i - 1) {
                         Some(t) => t,
                         None => {
-                            println!("Can't find a task with index {}", i);
+                            output_error_and_wait(&format!("Can't find a task with index {}", i))?;
                             continue
                         }
                     };
                     t.is_completed = true;
                 }
-                Action::Help => help(),
+                Action::Help => help()?,
                 Action::Close => {
                     break;
                 }
@@ -171,7 +214,7 @@ impl App {
             }
         }
         self.save_to_file()?;
-
+        clear_screen();
         Ok(last_act)
     }
     fn handle_last(&mut self, act: &Action) -> Result<AppOk, AppError> {
@@ -216,14 +259,27 @@ impl App {
             f.flush()?;
             return Ok(());
         }
-        Err(std::io::Error::new(ErrorKind::Other, "List isn't opened").into())
+        Err(io::Error::new(ErrorKind::Other, "List isn't opened").into())
     }
 }
 #[derive(Debug)]
 enum AppError {
     FileNotOpened,
-    OpenFailed(std::io::Error),
-    DeleteFailed(std::io::Error),
+    OpenFailed(io::Error),
+    DeleteFailed(io::Error),
+    #[allow(dead_code)] IOError(io::Error),
+}
+fn output_error_and_wait(e: &String) -> io::Result<()> {
+    execute!(io::stdout(), MoveTo(0, terminal::size()?.1 - 1), Clear(ClearType::CurrentLine))?;
+    execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Red),
+        Print(format!("{e}, Press Enter to continue")),
+        ResetColor
+    )?;
+    io::stdout().flush()?;
+    let _ = input()?;
+    Ok(())
 }
 #[derive(Debug)]
 enum AppOk {
@@ -233,7 +289,7 @@ enum AppOk {
     CalledDelete,
     None,
 }
-fn help() {
+fn help() -> io::Result<()> {
     let help_info = String::from("Commands:\n\
     * create list \"path\\to\\new\\list.json\" - will create and open a new to do list\n\
     * create task \"Task description\" priority - will create a new task in opened list\n\
@@ -244,8 +300,16 @@ fn help() {
     * complete task_index - will mark a task in opened list as complete\n\
     * help - will display this menu\n\
     * save - will save list info to\n\
-    * exit - will exit the program(you should use this ff you don't want to lose all new tasks)");
-    println!("{help_info}");
+    * exit - will exit the program(you should use this ff you don't want to lose all new tasks)\n\
+    Press Enter to continue.");
+    execute!(io::stdout(), MoveTo(0, terminal::size()?.1 - 1), Clear(ClearType::CurrentLine))?;
+    execute!(
+        io::stdout(),
+        Print(help_info),
+    )?;
+    io::stdout().flush()?;
+    let _ = input()?;
+    Ok(())
 }
 #[derive(Serialize, Deserialize, Debug)]
 struct Task {
@@ -427,9 +491,42 @@ fn parse_target(tokens: &Vec<Token>) -> Result<Action, String> {
     }
 }
 fn stdin_to_action() -> Result<Action, Box<dyn std::error::Error>> {
-    let mut target = String::new();
-    std::io::stdin().read_line(&mut target)?;
+    let target = input()?;
     let tokens = lex(&target)?;
     let act = parse_target(&tokens)?;
     Ok(act)
+}
+fn input() -> io::Result<String> {
+    let mut inp = String::new();
+    let (_, rows) = terminal::size()?;
+    loop {
+        execute!(io::stdout(), MoveTo(0, rows - 1), Clear(ClearType::CurrentLine))?;
+        execute!(io::stdout(), Print(&inp))?;
+        execute!(io::stdout(), Clear(ClearType::UntilNewLine))?;
+        io::stdout().flush()?;
+        if let Event::Key(key) = read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => break,
+                KeyCode::Backspace => {
+                    inp.pop();
+                }
+                KeyCode::Char(c) => {
+                    inp.push(c);
+                },
+                _ => {}
+            }
+        }
+    }
+    Ok(inp)
+}
+fn clear_screen() {
+    match execute!(io::stdout(), Clear(ClearType::All)) {
+        Ok(_) => {},
+        Err(e) => {
+            eprintln!("Can't clear stdout: {e}");
+        }
+    };
 }
